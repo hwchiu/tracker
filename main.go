@@ -4,226 +4,297 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gocolly/colly"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 	"github.com/sendgrid/sendgrid-go"
 	"github.com/sendgrid/sendgrid-go/helpers/mail"
 )
 
-var HERMES_URL string = "https://www.hermes.com/tw/zh/"
-var content string = ""
+const hermesBase = "https://www.hermes.com/tw/zh/"
 
-//type Asset struct {
-//	Url        string `json:"url"`
-//	Asset_type string `json:"type"`
-//	Source     string `json:"source"`
-//}
+var (
+	bagPattern = regexp.MustCompile(`(?i).*(constance|lindy|kelly|picotin).*`)
+
+	apiURLs = []string{
+		"https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSSMALLLEATHER&sort=relevance&pagesize=40",
+		"https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSBAGSCLUTCHES&sort=relevance&pagesize=40",
+	}
+)
 
 type Item struct {
-	Sku         string `json:"sku"`
-	Title       string `json:"title"`
-	ProductCode string `json:"productCode"`
-	AvgColor    string `json:"avgColor"`
-	Price       int    `json:"price"`
-	Url         string `json:"url"`
-	Slug        string `json:"slug"`
-	// Assets      []Asset `json:"assets"`
+	Sku      string `json:"sku"`
+	Title    string `json:"title"`
+	AvgColor string `json:"avgColor"`
+	Price    int    `json:"price"`
+	Url      string `json:"url"`
+	Slug     string `json:"slug"`
 }
 
-type Products struct {
-	Items []Item `json:"items"`
+type apiResponse struct {
+	Products struct {
+		Items []Item `json:"items"`
+	} `json:"products"`
 }
 
-type Response struct {
-	Total    int      `json:"total"`
-	Products Products `json:"products"`
+// Tracker holds runtime state so we avoid global variables.
+type Tracker struct {
+	browser       *rod.Browser
+	tgBot         *tgbotapi.BotAPI
+	tgChatID      int64
+	notifiedItems map[string]struct{}
 }
 
-func parse_send() {
-	target := ""
+func newTracker() (*Tracker, error) {
+	t := &Tracker{
+		notifiedItems: make(map[string]struct{}),
+	}
 
-	c := colly.NewCollector()
-	content := ""
-	c.OnHTML(".product-items", func(e *colly.HTMLElement) {
-		//	fmt.Printf("%s\n", e.ChildAttr(".product-item-name", e.Text))
-
-		link := fmt.Sprintf("https://www.hermes.com%s\n", e.ChildAttr("a", "href"))
-		name := strings.TrimSpace(fmt.Sprintln(e.DOM.Find("span.product-item-name").Eq(0).Text()))
-		color := strings.TrimSpace(fmt.Sprintln(strings.Split(e.DOM.Find("span.product-item-colors").Eq(0).Text(), ",")[1]))
-		price := strings.TrimSpace(fmt.Sprintln(strings.Split(e.DOM.Find("span.price.medium").Eq(0).Text(), "\n")[0]))
-		matched, _ := regexp.MatchString(`(?i).*(constance|lindy|kelly|picotin).*`, name)
-		if matched {
-			content = fmt.Sprintf("%s\n%s(%s)  %s -> %s", target, name, price, color, link)
+	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
+		bot, err := tgbotapi.NewBotAPI(token)
+		if err != nil {
+			return nil, fmt.Errorf("telegram init: %w", err)
 		}
-	})
+		t.tgBot = bot
+		log.Printf("[telegram] authorised as %s", bot.Self.UserName)
+	}
 
-	c.OnError(func(r *colly.Response, err error) {
-		fmt.Println("Request URL: ", r.Request.URL, " failed with response: ", r, "\nError: ", err)
-	})
-	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting", r.URL)
-		r.Headers.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36")
-		//		r.Headers.Set("accept-encoding", "gzip, deflate, br")
-		r.Headers.Set("accept", "application/json, text/plain, */*")
-		r.Headers.Set("accept-language", "en-US,en;q=0.9")
-		r.Headers.Set("referer", "https://www.hermes.com/tw/zh/")
-		r.Headers.Set("sec-ch-ua-full-version-list", "\"Not?A_Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"108.0.5359.125\"")
-		r.Headers.Set("Content-Type", "application/x-www-form-urlencoded")
-		r.Headers.Set("cookie", " has_js=1; ECOM_SESS=sx5hjasn21zhhh9p43iznidedh; correlation_id=6zwfiux968opu9nvhqf7emevotbvxciaqubnxhrkgqk01xhenypy12gsiwj6o3w2; x-xsrf-token=bc326229-59fd-470a-bfdf-a5e2706da6a8; datadome=j-HWg1Y2FEh9nlsj~m9xYHTngWXD1TOgpbQOAggL8qxSbs3Aj7NN0jxSGy4iEDKgHkKErzdeBFKFMPSCq~IEIU5oO2Hrb64Els2ITdeL091Etz6AyF~TTz48NsQ~m1G")
-		r.Headers.Set("cache-control", "no-cache")
-		r.Headers.Set("dnt", "1")
-		r.Headers.Set("sec-ch-device-memory", "8")
-		r.Headers.Set("sec-ch-ua", "Not A(Brand';v='24', 'Chromium';v='110")
-		r.Headers.Set("sec-ch-ua-arch", "arm")
-		r.Headers.Set("sec-ch-ua-full-version-list", "Not A(Brand';v='24.0.0.0', 'Chromium';v='110.0.5481.100'")
-		r.Headers.Set("sec-ch-ua-mobile", "?0")
-		r.Headers.Set("sec-ch-ua-model", "")
-		r.Headers.Set("sec-ch-ua-platform", "macOS")
-		r.Headers.Set("sec-fetch-dest", "document")
-		r.Headers.Set("sec-fetch-mode", "navigate")
-		r.Headers.Set("sec-fetch-site", "same-origin")
-		r.Headers.Set("sec-fetch-user", "?1")
-		r.Headers.Set("Origin", "https://www.hermes.com")
-		r.Headers.Set("Host", "bck.hermes.com")
-		r.Headers.Set("x-hermes-locale", "tw_zh")
-	})
+	if idStr := os.Getenv("TELEGRAM_CHAT_ID"); idStr != "" {
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TELEGRAM_CHAT_ID: %w", err)
+		}
+		t.tgChatID = id
+	}
 
-	//c.Visit("https://www.hermes.com/tw/zh/category/women/bags-and-small-leather-goods/bags-and-clutches")
-	//c.Visit("https://www.hermes.com/tw/zh/category/women/bags-and-small-leather-goods/small-leather-goods")
-	c.Visit("https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSSMALLLEATHER&sort=relevance&pagesize=40")
-	fmt.Println(content)
-	if content == "" {
-		fmt.Println("還沒發現")
-		return
+	t.browser = launchBrowser()
+	return t, nil
+}
+
+func (t *Tracker) Close() {
+	if t.browser != nil {
+		t.browser.MustClose()
+	}
+}
+
+// launchBrowser starts a headless Chromium instance.
+// Set CHROME_PATH env var to use a system-installed Chromium instead of
+// letting rod download its own binary (useful inside Docker).
+func launchBrowser() *rod.Browser {
+	l := launcher.New().
+		Headless(true).
+		// Remove automation flags that DataDome can detect
+		Set("disable-blink-features", "AutomationControlled").
+		// Required for running inside Docker / cloud containers
+		Set("no-sandbox").
+		Set("disable-dev-shm-usage").
+		Set("disable-gpu").
+		// Realistic window size
+		Set("window-size", "1920,1080")
+
+	if chromePath := os.Getenv("CHROME_PATH"); chromePath != "" {
+		l = l.Bin(chromePath)
+	}
+
+	u := l.MustLaunch()
+	browser := rod.New().ControlURL(u).MustConnect()
+
+	// Override navigator.webdriver to false — bot detectors check this property.
+	browser.MustSetCookies()
+	browser.MustHandleAuth("", "")
+
+	return browser
+}
+
+// warmPage opens a real browser tab on hermes.com so that DataDome runs its
+// full JS challenge and issues a valid datadome cookie.  The returned page
+// stays open so subsequent fetch() calls inside it inherit those cookies and
+// Chrome's TLS fingerprint (not Go's stdlib TLS, which DataDome fingerprints).
+func warmPage(browser *rod.Browser) (*rod.Page, error) {
+	page, err := browser.Page(proto.TargetCreateTarget{URL: hermesBase})
+	if err != nil {
+		return nil, fmt.Errorf("open page: %w", err)
+	}
+
+	// Mask navigator.webdriver before any scripts run on the page.
+	if _, err := page.EvalOnNewDocument(`Object.defineProperty(navigator,'webdriver',{get:()=>undefined})`); err != nil {
+		page.Close()
+		return nil, fmt.Errorf("inject webdriver mask: %w", err)
+	}
+
+	if err := page.WaitLoad(); err != nil {
+		page.Close()
+		return nil, fmt.Errorf("wait load: %w", err)
+	}
+
+	// Give DataDome JS challenge extra time to complete and set its cookie.
+	time.Sleep(4 * time.Second)
+
+	return page, nil
+}
+
+// fetchProducts runs a fetch() call *inside* the open browser page so the
+// request carries Chrome's real TLS fingerprint + DataDome cookies.
+func fetchProducts(page *rod.Page, apiURL string) ([]Item, error) {
+	// The JS string is safe: apiURL is a compile-time constant, not user input.
+	js := fmt.Sprintf(`async () => {
+		const resp = await fetch(%q, {
+			method: 'GET',
+			headers: {
+				'Accept':           'application/json, text/plain, */*',
+				'Accept-Language':  'zh-TW,zh;q=0.9,en-US;q=0.8',
+				'x-hermes-locale': 'tw_zh',
+				'Referer':          'https://www.hermes.com/tw/zh/',
+			},
+			credentials: 'include',
+		});
+		if (!resp.ok) throw new Error('HTTP ' + resp.status);
+		return await resp.text();
+	}`, apiURL)
+
+	result, err := page.Eval(js)
+	if err != nil {
+		return nil, fmt.Errorf("browser fetch: %w", err)
+	}
+
+	var response apiResponse
+	if err := json.Unmarshal([]byte(result.Value.String()), &response); err != nil {
+		return nil, fmt.Errorf("decode json: %w", err)
+	}
+
+	return response.Products.Items, nil
+}
+
+func (t *Tracker) sendTelegram(message string) error {
+	if t.tgBot == nil || t.tgChatID == 0 {
+		return nil
+	}
+	msg := tgbotapi.NewMessage(t.tgChatID, message)
+	msg.ParseMode = tgbotapi.ModeHTML
+	_, err := t.tgBot.Send(msg)
+	return err
+}
+
+func sendEmail(content string) error {
+	key := os.Getenv("SENDGRID_API_KEY")
+	if key == "" {
+		return nil
 	}
 	from := mail.NewEmail(os.Getenv("SEND_FROM_NAME"), os.Getenv("SEND_FROM_ADDRESS"))
 	to := mail.NewEmail(os.Getenv("SEND_TO_NAME"), os.Getenv("SEND_TO_ADDRESS"))
-	subject := "Hermes 進貨囉"
+	message := mail.NewSingleEmail(from, "Hermes 進貨囉", to, content, "")
 
-	message := mail.NewSingleEmail(from, subject, to, content, "")
-	//message.AddPersonalizations(personalization)
-
-	// Attempt to send the email
-	client := sendgrid.NewSendClient(os.Getenv("SENDGRID_API_KEY"))
-	response, err := client.Send(message)
+	client := sendgrid.NewSendClient(key)
+	resp, err := client.Send(message)
 	if err != nil {
-		fmt.Println("Unable to send your email")
-		log.Fatal(err)
+		return fmt.Errorf("sendgrid: %w", err)
 	}
-	// Check if it was sent
-	statusCode := response.StatusCode
-	if statusCode == 200 || statusCode == 201 || statusCode == 202 {
-		fmt.Println("Email sent!")
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("sendgrid status %d: %s", resp.StatusCode, resp.Body)
 	}
-
+	return nil
 }
 
-func parse_json(url string) string {
-	r, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		log.Fatal(err)
+func (t *Tracker) notify(items []Item) {
+	for _, item := range items {
+		if _, seen := t.notifiedItems[item.Sku]; seen {
+			continue
+		}
+
+		productURL := hermesBase + strings.TrimPrefix(item.Url, "/")
+
+		tgMsg := fmt.Sprintf(
+			"🛍 <b>Hermès 進貨通知</b>\n\n"+
+				"<b>%s</b>\n"+
+				"顏色：%s\n"+
+				"售價：NT$%d\n"+
+				"<a href=\"%s\">查看商品 →</a>",
+			item.Title, item.AvgColor, item.Price, productURL,
+		)
+
+		emailContent := fmt.Sprintf(
+			"Hermès 進貨通知\n\n%s\n顏色：%s\n售價：NT$%d\n%s",
+			item.Title, item.AvgColor, item.Price, productURL,
+		)
+
+		if err := t.sendTelegram(tgMsg); err != nil {
+			log.Printf("[telegram] error sending %s: %v", item.Slug, err)
+		} else if t.tgBot != nil {
+			log.Printf("[telegram] sent: %s", item.Slug)
+		}
+
+		if err := sendEmail(emailContent); err != nil {
+			log.Printf("[email] error sending %s: %v", item.Slug, err)
+		} else if os.Getenv("SENDGRID_API_KEY") != "" {
+			log.Printf("[email] sent: %s", item.Slug)
+		}
+
+		t.notifiedItems[item.Sku] = struct{}{}
 	}
+}
 
-	r.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36")
-	r.Header.Set("accept", "application/json, text/plain, */*")
-	r.Header.Set("accept-language", "en-US,en;q=0.9")
-	r.Header.Set("referer", "https://www.hermes.com/tw/zh/")
-	r.Header.Set("sec-ch-ua-full-version-list", "\"Not?A_Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"108.0.5359.125\"")
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.Header.Set("cookie", " has_js=1; ECOM_SESS=sx5hjasn21zhhh9p43iznidedh; correlation_id=6zwfiux968opu9nvhqf7emevotbvxciaqubnxhrkgqk01xhenypy12gsiwj6o3w2; x-xsrf-token=bc326229-59fd-470a-bfdf-a5e2706da6a8; datadome=j-HWg1Y2FEh9nlsj~m9xYHTngWXD1TOgpbQOAggL8qxSbs3Aj7NN0jxSGy4iEDKgHkKErzdeBFKFMPSCq~IEIU5oO2Hrb64Els2ITdeL091Etz6AyF~TTz48NsQ~m1G")
-	r.Header.Set("cache-control", "no-cache")
-	r.Header.Set("dnt", "1")
-	r.Header.Set("sec-ch-device-memory", "8")
-	r.Header.Set("sec-ch-ua", "Not A(Brand';v='24', 'Chromium';v='110")
-	r.Header.Set("sec-ch-ua-arch", "arm")
-	r.Header.Set("sec-ch-ua-full-version-list", "Not A(Brand';v='24.0.0.0', 'Chromium';v='110.0.5481.100'")
-	r.Header.Set("sec-ch-ua-mobile", "?0")
-	r.Header.Set("sec-ch-ua-model", "")
-	r.Header.Set("sec-ch-ua-platform", "macOS")
-	r.Header.Set("sec-fetch-dest", "document")
-	r.Header.Set("sec-fetch-mode", "navigate")
-	r.Header.Set("sec-fetch-site", "same-origin")
-	r.Header.Set("sec-fetch-user", "?1")
-	r.Header.Set("Origin", "https://www.hermes.com")
-	r.Header.Set("Host", "bck.hermes.com")
-	r.Header.Set("x-hermes-locale", "tw_zh")
+// scan opens a fresh page, warms the DataDome session, queries all API
+// endpoints, and notifies for any new matching items.
+func (t *Tracker) scan() error {
+	log.Println("[scan] starting...")
 
-	client := &http.Client{}
-	resp, err := client.Do(r)
+	page, err := warmPage(t.browser)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("warm page: %w", err)
 	}
+	defer page.Close()
 
-	//	decoder := json.NewDecoder(resp.Body)
-	//	fmt.Print(decoder)
-	var response Response
-	decoder := json.NewDecoder(resp.Body)
-
-	err = decoder.Decode(&response)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for _, item := range response.Products.Items {
-		matched, _ := regexp.MatchString(`(?i).*(constance|lindy|kelly|picotin).*`, item.Slug)
-		if matched {
-			content = fmt.Sprintf("%s\n\n%s\n$%d(%s)  -> %s", content, item.Slug, item.Price, item.AvgColor, HERMES_URL+item.Url)
+	var matched []Item
+	for _, apiURL := range apiURLs {
+		items, err := fetchProducts(page, apiURL)
+		if err != nil {
+			log.Printf("[scan] fetch error (%s): %v", apiURL, err)
+			continue
+		}
+		for _, item := range items {
+			if bagPattern.MatchString(item.Slug) || bagPattern.MatchString(item.Title) {
+				matched = append(matched, item)
+				log.Printf("[found] %s | %s | NT$%d", item.Title, item.AvgColor, item.Price)
+			}
 		}
 	}
 
-	fmt.Println(content)
-	defer resp.Body.Close()
-	return content
-}
-
-func send(content string) {
-	from := mail.NewEmail(os.Getenv("SEND_FROM_NAME"), os.Getenv("SEND_FROM_ADDRESS"))
-	to := mail.NewEmail(os.Getenv("SEND_TO_NAME"), os.Getenv("SEND_TO_ADDRESS"))
-	subject := "Hermes 進貨囉"
-
-	message := mail.NewSingleEmail(from, subject, to, content, "")
-	//message.AddPersonalizations(personalization)
-
-	// Attempt to send the email
-	client := sendgrid.NewSendClient(os.Getenv("SENDGRID_API_KEY"))
-	response, err := client.Send(message)
-	if err != nil {
-		fmt.Println("Unable to send your email")
-		log.Fatal(err)
+	if len(matched) == 0 {
+		log.Println("[scan] 還沒發現任何包款")
+		return nil
 	}
-	// Check if it was sent
-	statusCode := response.StatusCode
-	if statusCode == 200 || statusCode == 201 || statusCode == 202 {
-		fmt.Println("Email sent!")
-	}
+
+	t.notify(matched)
+	return nil
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	if err := godotenv.Load(); err != nil {
+		log.Println("[config] no .env file, using environment variables")
 	}
 
-	//for {
-	//	parse_send()
-	//	time.Sleep(time.Second * 600)
-	//}
+	tracker, err := newTracker()
+	if err != nil {
+		log.Fatalf("[init] %v", err)
+	}
+	defer tracker.Close()
+
+	log.Println("[main] tracker started — polling every 10 minutes")
 
 	for {
-		content = ""
-		parse_json("https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSSMALLLEATHER&sort=relevance&pagesize=40")
-		parse_json("https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSBAGSCLUTCHES&sort=relevance&pagesize=40")
-		if content == "" {
-			fmt.Println("還沒發現")
-		} else {
-			send(content)
+		if err := tracker.scan(); err != nil {
+			log.Printf("[main] scan failed: %v — restarting browser", err)
+			tracker.Close()
+			tracker.browser = launchBrowser()
 		}
-		time.Sleep(time.Second * 600)
+		time.Sleep(10 * time.Minute)
 	}
 }
