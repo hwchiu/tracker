@@ -1,29 +1,53 @@
 # ── Build stage ─────────────────────────────────────────────────────────────
-FROM golang:1.24-bookworm AS builder
+FROM python:3.12-bookworm AS builder
 
 WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o tracker .
+# Pre-fetch Camoufox's anti-detect Firefox binary
+RUN python -m camoufox fetch
+
+# Install Patchright's Chromium as a fallback + system deps
+RUN python -m patchright install --with-deps chromium
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
-# Use a Debian image with Chromium available so rod can use the system browser
-# instead of downloading its own binary at startup.
-FROM debian:bookworm-slim
+FROM python:3.12-slim-bookworm
 
+# System dependencies required by browsers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromium \
         ca-certificates \
+        libglib2.0-0 \
+        libnss3 \
+        libnspr4 \
+        libdbus-1-3 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libdrm2 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libpango-1.0-0 \
+        libcairo2 \
+        libasound2 \
+        libxshmfence1 \
+        libgtk-3-0 \
+        libx11-xcb1 \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/tracker .
 
-# Tell rod to use the system Chromium instead of downloading one
-ENV CHROME_PATH=/usr/bin/chromium
-# Chromium flags for containerised / headless environments
-ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+# Copy installed Python packages from builder
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 
-ENTRYPOINT ["./tracker"]
+# Copy Camoufox browser data
+COPY --from=builder /root/.cache /root/.cache
+
+COPY . .
+
+ENTRYPOINT ["python", "main.py"]
