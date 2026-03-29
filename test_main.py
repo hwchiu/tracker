@@ -104,7 +104,7 @@ class TestBagPattern:
         ],
     )
     def test_bag_pattern_matches(self, text, expected):
-        assert m.BAG_PATTERN.match(text) is not None if expected else m.BAG_PATTERN.match(text) is None
+        assert (m.BAG_PATTERN.match(text) is not None) == expected
 
 
 # ── parse_api_response ────────────────────────────────────────────────────────

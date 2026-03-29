@@ -7,7 +7,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from dotenv import load_dotenv
 import httpx
@@ -185,9 +185,9 @@ class Tracker:
         )
 
         # Browser state (set by launch_browser)
-        self._browser_cm: object | None = None   # Camoufox context-manager
-        self._browser: object | None = None       # BrowserContext or Browser
-        self._pw: object | None = None            # Playwright instance (Patchright only)
+        self._browser_cm: Any = None   # Camoufox context-manager
+        self._browser: Any = None      # BrowserContext or Browser
+        self._pw: Any = None           # Playwright instance (Patchright only)
         self._engine: str = ""
 
     # ── browser lifecycle ─────────────────────────────────────────────────
@@ -228,14 +228,14 @@ class Tracker:
 
     # ── scraping ──────────────────────────────────────────────────────────
 
-    def warm_page(self):
+    def warm_page(self) -> Any:
         """Open hermes.com so DataDome issues a valid session cookie."""
         page = self._browser.new_page()  # type: ignore[union-attr]
         page.goto(HERMES_BASE, wait_until="domcontentloaded")
         time.sleep(4)
         return page
 
-    def fetch_products(self, page, api_url: str) -> list[Item]:
+    def fetch_products(self, page: Any, api_url: str) -> list[Item]:
         """Run fetch() inside the browser to inherit its TLS fingerprint + cookies."""
         js = f"""async () => {{
             const resp = await fetch({json.dumps(api_url)}, {{
