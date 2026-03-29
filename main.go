@@ -28,6 +28,9 @@ var (
 		"https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSSMALLLEATHER&sort=relevance&pagesize=40",
 		"https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSBAGSCLUTCHES&sort=relevance&pagesize=40",
 	}
+
+	// sendgridHost can be overridden in tests to point at a mock HTTP server.
+	sendgridHost = "https://api.sendgrid.com"
 )
 
 type Item struct {
@@ -45,12 +48,61 @@ type apiResponse struct {
 	} `json:"products"`
 }
 
+// parseAPIResponse unmarshals a raw JSON string from the Hermès API.
+func parseAPIResponse(jsonStr string) ([]Item, error) {
+	var response apiResponse
+	if err := json.Unmarshal([]byte(jsonStr), &response); err != nil {
+		return nil, fmt.Errorf("decode json: %w", err)
+	}
+	return response.Products.Items, nil
+}
+
+// filterBags returns only the items whose slug or title matches bagPattern.
+func filterBags(items []Item) []Item {
+	var matched []Item
+	for _, item := range items {
+		if bagPattern.MatchString(item.Slug) || bagPattern.MatchString(item.Title) {
+			matched = append(matched, item)
+		}
+	}
+	return matched
+}
+
+// itemProductURL returns the full product URL for an item.
+func itemProductURL(item Item) string {
+	return hermesBase + strings.TrimPrefix(item.Url, "/")
+}
+
+// buildTelegramMessage returns the HTML-formatted Telegram notification for one item.
+func buildTelegramMessage(item Item) string {
+	return fmt.Sprintf(
+		"🛍 <b>Hermès 進貨通知</b>\n\n"+
+			"<b>%s</b>\n"+
+			"顏色：%s\n"+
+			"售價：NT$%d\n"+
+			"<a href=\"%s\">查看商品 →</a>",
+		item.Title, item.AvgColor, item.Price, itemProductURL(item),
+	)
+}
+
+// buildEmailContent returns the plain-text email body for one item.
+func buildEmailContent(item Item) string {
+	return fmt.Sprintf(
+		"Hermès 進貨通知\n\n%s\n顏色：%s\n售價：NT$%d\n%s",
+		item.Title, item.AvgColor, item.Price, itemProductURL(item),
+	)
+}
+
 // Tracker holds runtime state so we avoid global variables.
 type Tracker struct {
 	browser       *rod.Browser
 	tgBot         *tgbotapi.BotAPI
 	tgChatID      int64
 	notifiedItems map[string]struct{}
+
+	// Injectable notification functions — replaced in tests with mock implementations.
+	emailSend    func(content string) error
+	telegramSend func(message string) error
 }
 
 func newTracker() (*Tracker, error) {
@@ -74,6 +126,9 @@ func newTracker() (*Tracker, error) {
 		}
 		t.tgChatID = id
 	}
+
+	t.emailSend = sendEmail
+	t.telegramSend = t.sendTelegram
 
 	t.browser = launchBrowser()
 	return t, nil
@@ -165,12 +220,7 @@ func fetchProducts(page *rod.Page, apiURL string) ([]Item, error) {
 		return nil, fmt.Errorf("browser fetch: %w", err)
 	}
 
-	var response apiResponse
-	if err := json.Unmarshal([]byte(result.Value.String()), &response); err != nil {
-		return nil, fmt.Errorf("decode json: %w", err)
-	}
-
-	return response.Products.Items, nil
+	return parseAPIResponse(result.Value.String())
 }
 
 func (t *Tracker) sendTelegram(message string) error {
@@ -193,6 +243,7 @@ func sendEmail(content string) error {
 	message := mail.NewSingleEmail(from, "Hermes 進貨囉", to, content, "")
 
 	client := sendgrid.NewSendClient(key)
+	client.Request.BaseURL = sendgridHost
 	resp, err := client.Send(message)
 	if err != nil {
 		return fmt.Errorf("sendgrid: %w", err)
@@ -209,29 +260,13 @@ func (t *Tracker) notify(items []Item) {
 			continue
 		}
 
-		productURL := hermesBase + strings.TrimPrefix(item.Url, "/")
-
-		tgMsg := fmt.Sprintf(
-			"🛍 <b>Hermès 進貨通知</b>\n\n"+
-				"<b>%s</b>\n"+
-				"顏色：%s\n"+
-				"售價：NT$%d\n"+
-				"<a href=\"%s\">查看商品 →</a>",
-			item.Title, item.AvgColor, item.Price, productURL,
-		)
-
-		emailContent := fmt.Sprintf(
-			"Hermès 進貨通知\n\n%s\n顏色：%s\n售價：NT$%d\n%s",
-			item.Title, item.AvgColor, item.Price, productURL,
-		)
-
-		if err := t.sendTelegram(tgMsg); err != nil {
+		if err := t.telegramSend(buildTelegramMessage(item)); err != nil {
 			log.Printf("[telegram] error sending %s: %v", item.Slug, err)
 		} else if t.tgBot != nil {
 			log.Printf("[telegram] sent: %s", item.Slug)
 		}
 
-		if err := sendEmail(emailContent); err != nil {
+		if err := t.emailSend(buildEmailContent(item)); err != nil {
 			log.Printf("[email] error sending %s: %v", item.Slug, err)
 		} else if os.Getenv("SENDGRID_API_KEY") != "" {
 			log.Printf("[email] sent: %s", item.Slug)
@@ -259,12 +294,7 @@ func (t *Tracker) scan() error {
 			log.Printf("[scan] fetch error (%s): %v", apiURL, err)
 			continue
 		}
-		for _, item := range items {
-			if bagPattern.MatchString(item.Slug) || bagPattern.MatchString(item.Title) {
-				matched = append(matched, item)
-				log.Printf("[found] %s | %s | NT$%d", item.Title, item.AvgColor, item.Price)
-			}
-		}
+		matched = append(matched, filterBags(items)...)
 	}
 
 	if len(matched) == 0 {
@@ -272,6 +302,9 @@ func (t *Tracker) scan() error {
 		return nil
 	}
 
+	for _, item := range matched {
+		log.Printf("[found] %s | %s | NT$%d", item.Title, item.AvgColor, item.Price)
+	}
 	t.notify(matched)
 	return nil
 }
