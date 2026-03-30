@@ -7,6 +7,8 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from html import unescape
 from typing import Any, Callable, Optional
 
 from dotenv import load_dotenv
@@ -18,14 +20,23 @@ log = logging.getLogger(__name__)
 
 HERMES_BASE = "https://www.hermes.com/tw/zh/"
 
-BAG_PATTERN = re.compile(r"(?i).*(constance|lindy|kelly|picotin).*")
+BAG_PATTERN = re.compile(r"(?i).*(constance|lindy|kelly|picotin|bolide).*")
 
-API_URLS = [
-    "https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSSMALLLEATHER&sort=relevance&pagesize=40",
-    "https://bck.hermes.com/products?locale=tw_zh&category=WOMENBAGSBAGSCLUTCHES&sort=relevance&pagesize=40",
+# Category pages to scrape for available products.
+CATEGORY_URLS = [
+    "https://www.hermes.com/tw/zh/category/leather-goods/bags-and-clutches/womens-bags-and-clutches/",
 ]
 
-POLL_INTERVAL = 600  # seconds (10 minutes)
+POLL_INTERVAL = 90  # seconds — daytime default (overridden at runtime by poll_interval())
+
+# Taiwan time-based polling: faster during the day, slower at night.
+_TW = timezone(timedelta(hours=8))
+POLL_DAYTIME  = 90   # 08:00–22:00 Taiwan time
+POLL_NIGHTTIME = 180  # 22:00–08:00 Taiwan time
+
+def poll_interval() -> int:
+    hour = datetime.now(_TW).hour
+    return POLL_DAYTIME if 7 <= hour < 24 else POLL_NIGHTTIME
 
 # Overridable in tests to point at a mock HTTP server.
 sendgrid_host = "https://api.sendgrid.com"
@@ -61,6 +72,39 @@ def parse_api_response(json_str: str) -> list[Item]:
     ]
 
 
+def parse_html_products(html: str) -> list[Item]:
+    """Extract product items from Hermès category page HTML (Angular SSR)."""
+    items: list[Item] = []
+    for card in re.finditer(r'<h-grid-result-item[^>]*>(.*?)</h-grid-result-item>', html, re.DOTALL):
+        block = card.group(1)
+
+        # SKU from id="product-item-meta-H{SKU}"
+        m_sku = re.search(r'id="product-item-meta-H([^"]+)"', block)
+        if not m_sku:
+            continue
+        sku = m_sku.group(1)
+
+        # Title from <span class="product-title">…</span>
+        m_title = re.search(r'class="product-title"[^>]*>([^<]+)<', block)
+        title = unescape(m_title.group(1).strip()) if m_title else ""
+
+        # Color and href from <a … title="Title, Color" href="…">
+        m_link = re.search(r'class="product-item-name"[^>]+href="([^"]+)"[^>]+title="([^"]+)"', block)
+        url = m_link.group(1) if m_link else ""
+        color = ""
+        if m_link:
+            parts = unescape(m_link.group(2)).split(", ", 1)
+            color = parts[1] if len(parts) > 1 else ""
+
+        # Price from <span class="price …"> NT$ xx,xxx </span>
+        m_price = re.search(r'NT\$\s*([\d,]+)', block)
+        price = int(m_price.group(1).replace(",", "")) if m_price else 0
+
+        slug = url.strip("/").split("/")[-1] if url else ""
+        items.append(Item(sku=sku, title=title, avg_color=color, price=price, url=url, slug=slug))
+    return items
+
+
 def filter_bags(items: list[Item]) -> list[Item]:
     """Return only items whose slug or title matches the target bag pattern."""
     return [
@@ -71,7 +115,10 @@ def filter_bags(items: list[Item]) -> list[Item]:
 
 def item_product_url(item: Item) -> str:
     """Return the full product URL for an item."""
-    return HERMES_BASE + item.url.lstrip("/")
+    url = item.url
+    if url.startswith("http"):
+        return url
+    return "https://www.hermes.com" + ("" if url.startswith("/") else "/") + url
 
 
 def build_telegram_message(item: Item) -> str:
@@ -80,8 +127,9 @@ def build_telegram_message(item: Item) -> str:
         f"🛍 <b>Hermès 進貨通知</b>\n\n"
         f"<b>{item.title}</b>\n"
         f"顏色：{item.avg_color}\n"
-        f"售價：NT${item.price}\n"
-        f'<a href="{item_product_url(item)}">查看商品 →</a>'
+        f"售價：NT${item.price:,}\n"
+        f'<a href="{item_product_url(item)}">查看商品 →</a>\n\n'
+        f"@CharissaH 快看！"
     )
 
 
@@ -189,6 +237,7 @@ class Tracker:
         self._browser: Any = None      # BrowserContext or Browser
         self._pw: Any = None           # Playwright instance (Patchright only)
         self._engine: str = ""
+        self._pages: dict[str, Any] = {}  # persistent pages per category URL
 
     # ── browser lifecycle ─────────────────────────────────────────────────
 
@@ -197,7 +246,7 @@ class Tracker:
         try:
             from camoufox.sync_api import Camoufox  # type: ignore[import-untyped]
 
-            self._browser_cm = Camoufox(headless=True, proxy=self.proxy)
+            self._browser_cm = Camoufox(headless=True, proxy=self.proxy, geoip=True)
             self._browser = self._browser_cm.__enter__()
             self._engine = "camoufox"
             log.info("[browser] launched Camoufox (anti-detect Firefox)")
@@ -225,46 +274,45 @@ class Tracker:
         self._browser = None
         self._browser_cm = None
         self._pw = None
+        self._pages = {}
 
     # ── scraping ──────────────────────────────────────────────────────────
 
-    def warm_page(self) -> Any:
-        """Open hermes.com so DataDome issues a valid session cookie."""
-        page = self._browser.new_page()  # type: ignore[union-attr]
-        page.goto(HERMES_BASE, wait_until="domcontentloaded")
-        time.sleep(4)
-        return page
-
-    def fetch_products(self, page: Any, api_url: str) -> list[Item]:
-        """Run fetch() inside the browser to inherit its TLS fingerprint + cookies."""
-        js = f"""async () => {{
-            const resp = await fetch({json.dumps(api_url)}, {{
-                method: 'GET',
-                headers: {{
-                    'Accept':          'application/json, text/plain, */*',
-                    'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8',
-                    'x-hermes-locale': 'tw_zh',
-                    'Referer':         'https://www.hermes.com/tw/zh/',
-                }},
-                credentials: 'include',
-            }});
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            return await resp.text();
-        }}"""
-        result = page.evaluate(js)
-        return parse_api_response(result)
+    def fetch_products_from_page(self, category_url: str) -> list[Item]:
+        """Navigate/reload a persistent page and parse product items from the SSR HTML."""
+        if category_url not in self._pages:
+            page = self._browser.new_page()  # type: ignore[union-attr]
+            self._pages[category_url] = page
+        else:
+            page = self._pages[category_url]
+        try:
+            page.goto(category_url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(8)
+            html = page.content()
+        except Exception:
+            # Page may have crashed; discard it so next call creates a fresh one
+            try:
+                page.close()
+            except Exception:
+                pass
+            self._pages.pop(category_url, None)
+            raise
+        items = parse_html_products(html)
+        log.info("[scrape] %s → %d products", category_url, len(items))
+        return items
 
     # ── notification ──────────────────────────────────────────────────────
 
     def notify(self, items: list[Item]) -> None:
         for item in items:
-            if item.sku in self.notified_items:
+            dedup_key = f"{item.sku}_{item.avg_color}"
+            if dedup_key in self.notified_items:
                 continue
 
             try:
                 self.telegram_send(build_telegram_message(item))
                 if self.tg_token and self.tg_chat_id:
-                    log.info("[telegram] sent: %s", item.slug)
+                    log.info("[telegram] sent: %s (%s)", item.slug, item.avg_color)
             except Exception as exc:
                 log.error("[telegram] error sending %s: %s", item.slug, exc)
 
@@ -275,38 +323,34 @@ class Tracker:
             except Exception as exc:
                 log.error("[email] error sending %s: %s", item.slug, exc)
 
-            self.notified_items[item.sku] = None
+            self.notified_items[dedup_key] = None
 
     # ── scan loop ─────────────────────────────────────────────────────────
 
     def scan(self) -> None:
         log.info("[scan] starting...")
-        page = self.warm_page()
-        try:
-            matched: list[Item] = []
-            for api_url in API_URLS:
-                try:
-                    items = self.fetch_products(page, api_url)
-                    matched.extend(filter_bags(items))
-                except Exception as exc:
-                    log.error("[scan] fetch error (%s): %s", api_url, exc)
+        matched: list[Item] = []
+        for category_url in CATEGORY_URLS:
+            try:
+                items = self.fetch_products_from_page(category_url)
+                matched.extend(filter_bags(items))
+            except Exception as exc:
+                log.error("[scan] fetch error (%s): %s", category_url, exc)
 
-            if not matched:
-                log.info("[scan] 還沒發現任何包款")
-                return
+        if not matched:
+            log.info("[scan] 還沒發現任何包款")
+            return
 
-            for item in matched:
-                log.info(
-                    "[found] %s | %s | NT$%d",
-                    item.title, item.avg_color, item.price,
-                )
-            self.notify(matched)
-        finally:
-            page.close()
+        for item in matched:
+            log.info(
+                "[found] %s | %s | NT$%d",
+                item.title, item.avg_color, item.price,
+            )
+        self.notify(matched)
 
     def run(self) -> None:
         self.launch_browser()
-        log.info("[main] tracker started — polling every 10 minutes")
+        log.info("[main] tracker started — daytime %ds / nighttime %ds (Taiwan time)", POLL_DAYTIME, POLL_NIGHTTIME)
         try:
             while True:
                 try:
@@ -317,7 +361,9 @@ class Tracker:
                     )
                     self.close_browser()
                     self.launch_browser()
-                time.sleep(POLL_INTERVAL)
+                interval = poll_interval()
+                log.info("[main] next scan in %d seconds", interval)
+                time.sleep(interval)
         finally:
             self.close_browser()
 
