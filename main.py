@@ -31,12 +31,13 @@ POLL_INTERVAL = 90  # seconds — daytime default (overridden at runtime by poll
 
 # Taiwan time-based polling: faster during the day, slower at night.
 _TW = timezone(timedelta(hours=8))
-POLL_DAYTIME  = 90   # 08:00–22:00 Taiwan time
-POLL_NIGHTTIME = 180  # 22:00–08:00 Taiwan time
+POLL_DAYTIME  = 45    # 07:00–21:00 Taiwan time
+POLL_NIGHTTIME = None  # 21:00–07:00 Taiwan time — no scanning
 
-def poll_interval() -> int:
+def poll_interval() -> Optional[int]:
+    """Return poll interval in seconds, or None if outside active hours."""
     hour = datetime.now(_TW).hour
-    return POLL_DAYTIME if 7 <= hour < 24 else POLL_NIGHTTIME
+    return POLL_DAYTIME if 7 <= hour < 21 else None
 
 # Overridable in tests to point at a mock HTTP server.
 sendgrid_host = "https://api.sendgrid.com"
@@ -350,9 +351,20 @@ class Tracker:
 
     def run(self) -> None:
         self.launch_browser()
-        log.info("[main] tracker started — daytime %ds / nighttime %ds (Taiwan time)", POLL_DAYTIME, POLL_NIGHTTIME)
+        log.info("[main] tracker started — active 07:00–21:00 Taiwan time, every %ds", POLL_DAYTIME)
         try:
             while True:
+                interval = poll_interval()
+                if interval is None:
+                    # Outside active hours — calculate seconds until 07:00 TW
+                    now = datetime.now(_TW)
+                    next_start = now.replace(hour=7, minute=0, second=0, microsecond=0)
+                    if now.hour >= 21:
+                        next_start = next_start + timedelta(days=1)
+                    sleep_secs = int((next_start - now).total_seconds())
+                    log.info("[main] outside active hours — sleeping %dm until 07:00", sleep_secs // 60)
+                    time.sleep(sleep_secs)
+                    continue
                 try:
                     self.scan()
                 except Exception as exc:
@@ -361,7 +373,6 @@ class Tracker:
                     )
                     self.close_browser()
                     self.launch_browser()
-                interval = poll_interval()
                 log.info("[main] next scan in %d seconds", interval)
                 time.sleep(interval)
         finally:
